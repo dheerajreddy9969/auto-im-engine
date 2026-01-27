@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 
 st.set_page_config(page_title="Auto IM Engine", layout="wide")
 st.title("Auto Internal Movement Generator")
@@ -16,13 +15,17 @@ THRESHOLD = 55  # lines per bin
 def generate_im(inv_df, dem_df):
 
     # ---------------- Inventory preprocessing ----------------
-    inv_df = inv_df[inv_df.iloc[:, 2] == "PTL"]  # Column C
-    inv_df["SKU"] = inv_df.iloc[:, 13].astype(str).str.strip().str.upper()  # Column N
-    inv_df["Batch"] = inv_df.iloc[:, 16].astype(str).str.strip().str.upper()  # Column Q
+    inv_df = inv_df[inv_df.iloc[:, 2] == "PTL"]  # Column C = PTL
 
-    # PURE CONCAT (no separator)
-    inv_df["SKU_BATCH"] = inv_df["SKU"] + inv_df["Batch"]
+    inv_df["SKU_BATCH"] = (
+        inv_df.iloc[:, 17]  # Column R
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
 
+    inv_df["SKU"] = inv_df.iloc[:, 13].astype(str).str.strip().str.upper()   # Column N
+    inv_df["Batch"] = inv_df.iloc[:, 16].astype(str).str.strip().str.upper() # Column Q
     inv_df["Bin"] = inv_df.iloc[:, 4]   # Column E
     inv_df["Zone"] = inv_df.iloc[:, 3]  # Column D
     inv_df["Qty"] = inv_df.iloc[:, 24]  # Column Y
@@ -33,9 +36,6 @@ def generate_im(inv_df, dem_df):
         .astype(str)
         .str.strip()
         .str.upper()
-        .str.replace(" ", "")
-        .str.replace("-", "")
-        .str.replace("_", "")
     )
 
     dem_df["Daily_Avg_Lines"] = dem_df["Lines"]
@@ -66,7 +66,6 @@ def generate_im(inv_df, dem_df):
         zone = sku_inv.iloc[0]["Zone"]
         empty_bins = inv_df[(inv_df["Zone"] == zone) & (inv_df["Qty"] == 0)]
 
-        # Split back SKU and Batch for output
         sku = sku_inv.iloc[0]["SKU"]
         batch = sku_inv.iloc[0]["Batch"]
 
