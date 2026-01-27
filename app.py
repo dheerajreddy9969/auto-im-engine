@@ -17,15 +17,27 @@ def generate_im(inv_df, dem_df):
 
     # ---------------- Inventory preprocessing ----------------
     inv_df = inv_df[inv_df.iloc[:, 2] == "PTL"]  # Column C
-    inv_df["SKU"] = inv_df.iloc[:, 13].astype(str)  # Column N
-    inv_df["Batch"] = inv_df.iloc[:, 16].astype(str)  # Column Q
-    inv_df["SKU_BATCH"] = inv_df["SKU"] + "_" + inv_df["Batch"]
-    inv_df["Bin"] = inv_df.iloc[:, 4]  # Column E
+    inv_df["SKU"] = inv_df.iloc[:, 13].astype(str).str.strip().str.upper()  # Column N
+    inv_df["Batch"] = inv_df.iloc[:, 16].astype(str).str.strip().str.upper()  # Column Q
+
+    # PURE CONCAT (no separator)
+    inv_df["SKU_BATCH"] = inv_df["SKU"] + inv_df["Batch"]
+
+    inv_df["Bin"] = inv_df.iloc[:, 4]   # Column E
     inv_df["Zone"] = inv_df.iloc[:, 3]  # Column D
     inv_df["Qty"] = inv_df.iloc[:, 24]  # Column Y
 
     # ---------------- Demand preprocessing ----------------
-    dem_df["SKU_BATCH"] = dem_df["Sku-batch"].astype(str)
+    dem_df["SKU_BATCH"] = (
+        dem_df["Sku-batch"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(" ", "")
+        .str.replace("-", "")
+        .str.replace("_", "")
+    )
+
     dem_df["Daily_Avg_Lines"] = dem_df["Lines"]
     dem_df["Daily_Avg_Qty"] = dem_df["Quantity"]
 
@@ -54,8 +66,9 @@ def generate_im(inv_df, dem_df):
         zone = sku_inv.iloc[0]["Zone"]
         empty_bins = inv_df[(inv_df["Zone"] == zone) & (inv_df["Qty"] == 0)]
 
-        # Split SKU and Batch for output
-        sku, batch = sku_batch.split("_", 1)
+        # Split back SKU and Batch for output
+        sku = sku_inv.iloc[0]["SKU"]
+        batch = sku_inv.iloc[0]["Batch"]
 
         # ---------- BALANCING ----------
         if not empty_bins.empty:
@@ -65,8 +78,11 @@ def generate_im(inv_df, dem_df):
             total_qty = sku_inv["Qty"].sum()
             move_qty = round(total_qty / (B + 1))
 
-            im_rows.append([from_bin, "", sku, batch,
-                            "Good", "L0", move_qty, to_bin])
+            if move_qty > 0:
+                im_rows.append([
+                    from_bin, "", sku, batch,
+                    "Good", "L0", move_qty, to_bin
+                ])
 
         # ---------- CONSOLIDATION ----------
         else:
@@ -81,8 +97,11 @@ def generate_im(inv_df, dem_df):
             to_bin = sku_inv.groupby("Bin")["Qty"].sum().idxmin()
             move_qty = donor["Qty"]
 
-            im_rows.append([from_bin, "", donor["SKU"], donor["Batch"],
-                            "Good", "L0", move_qty, to_bin])
+            if move_qty > 0:
+                im_rows.append([
+                    from_bin, "", donor["SKU"], donor["Batch"],
+                    "Good", "L0", move_qty, to_bin
+                ])
 
     # ---------------- Output ----------------
     im_df = pd.DataFrame(im_rows,
@@ -101,8 +120,10 @@ if st.button("Generate IM"):
         im_df.to_excel(filename, index=False)
 
         with open(filename, "rb") as f:
-            st.download_button("Download IM File",
-                               data=f,
-                               file_name=filename)
+            st.download_button(
+                "Download IM File",
+                data=f,
+                file_name=filename
+            )
     else:
         st.error("Please upload both files.")
