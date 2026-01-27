@@ -1,17 +1,17 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
 
 st.set_page_config(page_title="Auto IM Engine", layout="wide")
 st.title("Auto Internal Movement Generator")
 
-st.markdown("Upload Inventory and PTL Demand files. System will generate directly uploadable IM file.")
+st.markdown("Upload Inventory Snapshot and PTL Demand file. System will generate directly uploadable IM file.")
 
 inv_file = st.file_uploader("Upload Inventory Snapshot", type=["xlsx"])
 dem_file = st.file_uploader("Upload PTL Demand File", type=["xlsx"])
 
 THRESHOLD = 55  # lines per bin
+
 
 def generate_im(inv_df, dem_df):
 
@@ -25,9 +25,9 @@ def generate_im(inv_df, dem_df):
     inv_df["Qty"] = inv_df.iloc[:, 24]  # Column Y
 
     # ---------------- Demand preprocessing ----------------
-    dem_df["SKU"] = dem_df["SKU"].astype(str)
-    dem_df["Batch"] = dem_df["Batch"].astype(str)
-    dem_df["SKU_BATCH"] = dem_df["SKU"] + "_" + dem_df["Batch"]
+    dem_df["SKU_BATCH"] = dem_df["Sku-batch"].astype(str)
+    dem_df["Daily_Avg_Lines"] = dem_df["Lines"]
+    dem_df["Daily_Avg_Qty"] = dem_df["Quantity"]
 
     # Top 30 by avg lines
     top30 = dem_df.sort_values("Daily_Avg_Lines", ascending=False).head(30)
@@ -54,6 +54,9 @@ def generate_im(inv_df, dem_df):
         zone = sku_inv.iloc[0]["Zone"]
         empty_bins = inv_df[(inv_df["Zone"] == zone) & (inv_df["Qty"] == 0)]
 
+        # Split SKU and Batch for output
+        sku, batch = sku_batch.split("_", 1)
+
         # ---------- BALANCING ----------
         if not empty_bins.empty:
             to_bin = empty_bins.iloc[0]["Bin"]
@@ -62,7 +65,7 @@ def generate_im(inv_df, dem_df):
             total_qty = sku_inv["Qty"].sum()
             move_qty = round(total_qty / (B + 1))
 
-            im_rows.append([from_bin, "", row["SKU"], row["Batch"],
+            im_rows.append([from_bin, "", sku, batch,
                             "Good", "L0", move_qty, to_bin])
 
         # ---------- CONSOLIDATION ----------
