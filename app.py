@@ -306,6 +306,29 @@ if "decision" in st.session_state:
         st.subheader("⚠️ Error Records")
         st.dataframe(d[d.Error_Flag == "YES"])
 
+st.subheader("🧪 IM Trigger Diagnostics")
+
+st.write("Consolidation candidates:")
+st.write(
+    st.session_state.decision[
+        st.session_state.decision.WMS_Bin_Count >
+        st.session_state.decision.Required_Zones
+    ][["Product Code","Batch","WMS_Bin_Count","Required_Zones"]]
+)
+
+st.write("Distribution candidates:")
+st.write(
+    st.session_state.decision[
+        st.session_state.decision.WMS_Bin_Count <
+        st.session_state.decision.Required_Zones
+    ][["Product Code","Batch","WMS_Bin_Count","Required_Zones"]]
+)
+
+
+
+
+
+
 # ==================================================
 # IM FILE GENERATION
 # ==================================================
