@@ -134,10 +134,16 @@ def consolidate_batch(batch_row, wms_bins):
 def distribute_batch(batch_row, wms_bins, empty_bins):
     moves = []
 
-    src = wms_bins[
+    src_bins = wms_bins[
         (wms_bins["SKU"] == batch_row["SKU"]) &
         (wms_bins["Batch"] == batch_row["Batch"])
-    ].sort_values("Qty", ascending=False).iloc[0]
+    ]
+
+    # 🔑 FIX: No source bins → cannot distribute
+    if src_bins.empty:
+        return moves
+
+    src = src_bins.sort_values("Qty", ascending=False).iloc[0]
 
     per_bin_qty = max(
         1, int(batch_row["Quantity"] / len(empty_bins))
@@ -152,6 +158,7 @@ def distribute_batch(batch_row, wms_bins, empty_bins):
         ])
 
     return moves
+
 
 
 # ==================================================
