@@ -8,7 +8,7 @@ from io import BytesIO
 # ==================================================
 st.set_page_config(page_title="PTL IM Engine", layout="wide")
 st.title("📦 PTL Internal Movement (IM) Engine")
-st.caption("SAP-aware | WMS-driven | Consolidation → Balancing")
+st.caption("SAP-aware | WMS-driven | Diagnostics enabled")
 
 # ==================================================
 # LOADERS
@@ -21,15 +21,8 @@ def load_ptl_demand(file):
 
 
 def load_sap_inventory(file):
-    """
-    SAP inventory is NOT directly used for IM execution yet,
-    but is loaded, validated, and kept ready for:
-    - batch prioritisation
-    - future allocation logic
-    """
     sap = pd.read_excel(file, sheet_name="batch mapping")
-
-    qty_col = sap.columns[16]  # Column Q as per your rule
+    qty_col = sap.columns[16]
 
     sap = sap.rename(columns={
         "product": "Product",
@@ -64,12 +57,12 @@ def load_wms_inventory(file):
         "Product", "SKU", "Batch", "Qty"
     ]
 
-    # ---- FIX: Zone must be numeric ----
+    # --- FIX: Zone numeric ---
     wms["Zone"] = pd.to_numeric(wms["Zone"], errors="coerce")
     wms = wms.dropna(subset=["Zone"])
     wms["Zone"] = wms["Zone"].astype(int)
 
-    # ---- Business filters ----
+    # --- Business filters ---
     wms = wms[
         (wms["Area"] == "PTL") &
         (wms["Zone"] <= 8) &
@@ -107,10 +100,6 @@ def build_wms_state(wms):
 
 
 def build_decision_table(ptl, wms_summary):
-    """
-    Decision table is Product–Batch based.
-    Required_Zones comes from PTL demand.
-    """
     decision = ptl.merge(
         wms_summary,
         left_on="Product Code",
@@ -271,7 +260,7 @@ generate_im = st.sidebar.button("🚚 Generate IM")
 if run_analysis and all([ptl_file, sap_file, wms_file, sku_file]):
 
     ptl = load_ptl_demand(ptl_file)
-    sap = load_sap_inventory(sap_file)     # ✅ SAP LOADED
+    sap = load_sap_inventory(sap_file)
     wms = load_wms_inventory(wms_file)
     sku_map = load_sku_master(sku_file)
 
@@ -279,14 +268,13 @@ if run_analysis and all([ptl_file, sap_file, wms_file, sku_file]):
     decision = build_decision_table(ptl, wms_summary)
     decision = detect_errors(decision, wms_bins, sku_map)
 
-    # Store in session
     st.session_state.decision = decision
     st.session_state.wms_bins = wms_bins
     st.session_state.sku_map = sku_map
-    st.session_state.sap = sap   # kept for future logic
+    st.session_state.sap = sap
 
 # ==================================================
-# DASHBOARD
+# DASHBOARD + DIAGNOSTICS
 # ==================================================
 
 if "decision" in st.session_state:
@@ -302,32 +290,28 @@ if "decision" in st.session_state:
     st.subheader("📋 Decision Table")
     st.dataframe(d, use_container_width=True)
 
+    # -------- DIAGNOSTICS --------
+    st.subheader("🧪 IM Trigger Diagnostics")
+
+    cons_diag = d[d.WMS_Bin_Count > d.Required_Zones]
+    dist_diag = d[d.WMS_Bin_Count < d.Required_Zones]
+
+    st.markdown("### 🔹 Consolidation Candidates")
+    st.write(cons_diag[["Product Code","Batch","WMS_Bin_Count","Required_Zones"]])
+
+    st.markdown("### 🔹 Distribution Candidates")
+    st.write(dist_diag[["Product Code","Batch","WMS_Bin_Count","Required_Zones"]])
+
+    st.markdown("### 🔹 NO ACTION (Balanced)")
+    st.write(
+        d[d.Action == "NO ACTION"]
+        [["Product Code","Batch","WMS_Bin_Count","Required_Zones"]]
+    )
+
     if (d.Error_Flag == "YES").any():
-        st.subheader("⚠️ Error Records")
-        st.dataframe(d[d.Error_Flag == "YES"])
-
-st.subheader("🧪 IM Trigger Diagnostics")
-
-st.write("Consolidation candidates:")
-st.write(
-    st.session_state.decision[
-        st.session_state.decision.WMS_Bin_Count >
-        st.session_state.decision.Required_Zones
-    ][["Product Code","Batch","WMS_Bin_Count","Required_Zones"]]
-)
-
-st.write("Distribution candidates:")
-st.write(
-    st.session_state.decision[
-        st.session_state.decision.WMS_Bin_Count <
-        st.session_state.decision.Required_Zones
-    ][["Product Code","Batch","WMS_Bin_Count","Required_Zones"]]
-)
-
-
-
-
-
+        st.subheader("⚠️ Error Records (Blocked IMs)")
+        st.write(d[d.Error_Flag == "YES"]
+                 [["Product Code","Batch","Action","Error_Reason"]])
 
 # ==================================================
 # IM FILE GENERATION
