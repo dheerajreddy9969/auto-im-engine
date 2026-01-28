@@ -8,15 +8,32 @@ from io import BytesIO
 # ==================================================
 st.set_page_config(page_title="PTL IM Engine", layout="wide")
 st.title("📦 PTL Internal Movement (IM) Engine")
-st.caption("Priority-driven | Batch-safe | Space-aware")
+st.caption("PTL-driven | SKU–Batch accurate | Preview before execution")
 
 # ==================================================
 # LOADERS
 # ==================================================
 
 def load_ptl_demand(file):
+    """
+    PTL Demand:
+    Column B = SKU
+    Column C = Batch
+    Lines & Quantity are SKU–Batch specific
+    """
     df = pd.read_excel(file)
-    df["Required_Zones"] = df["Lines"].apply(lambda x: math.ceil(x / 60))
+
+    df = df.rename(columns={
+        df.columns[1]: "SKU",      # Column B
+        df.columns[2]: "Batch",    # Column C
+        df.columns[3]: "Quantity",
+        df.columns[4]: "Lines"
+    })
+
+    df["Required_Zones"] = df["Lines"].apply(
+        lambda x: math.ceil(x / 60)
+    )
+
     return df
 
 
@@ -28,13 +45,7 @@ def load_sap_inventory(file):
         "product": "Product",
         "sku": "SKU",
         "batch": "Batch",
-        "type": "ATP_Type",
         qty_col: "Available_Qty"
-    })
-
-    sap["Alloc_Priority"] = sap["ATP_Type"].map({
-        "ATP_PICK": 1,
-        "ATP_RESERVE": 0
     })
 
     return sap
@@ -77,68 +88,43 @@ def load_sku_master(file):
 
 def build_wms_state(wms):
     bins = (
-        wms.groupby(["Product", "SKU", "Batch", "Bin"], as_index=False)
+        wms.groupby(["SKU", "Batch", "Bin"], as_index=False)
         .agg(Qty=("Qty", "sum"))
     )
 
     summary = (
-        bins.groupby(["Product", "Batch"], as_index=False)
-        .agg(
-            Bin_Count=("Bin", "nunique"),
-            Total_Qty=("Qty", "sum")
-        )
+        bins.groupby(["SKU", "Batch"], as_index=False)
+        .agg(Bin_Count=("Bin", "nunique"))
     )
 
     return bins, summary
 
 
 # ==================================================
-# CORE DECISION ENGINE
-# ==================================================
-
-def build_decision(ptl, sap, wms_summary):
-    decision = ptl.merge(
-        wms_summary,
-        left_on="Product Code",
-        right_on="Product",
-        how="inner"
-    )
-
-    decision = decision.merge(
-        sap[["Product", "Batch", "Alloc_Priority"]],
-        on=["Product", "Batch"],
-        how="left"
-    ).fillna({"Alloc_Priority": 0})
-
-    decision["Status"] = "NO ACTION"
-
-    return decision
-
-
-# ==================================================
-# IM GENERATION HELPERS
+# IM HELPERS
 # ==================================================
 
 def consolidate_batch(batch_row, wms_bins):
     moves = []
+
     bins = wms_bins[
-        (wms_bins["Product"] == batch_row["Product"]) &
+        (wms_bins["SKU"] == batch_row["SKU"]) &
         (wms_bins["Batch"] == batch_row["Batch"])
     ].sort_values("Qty")
 
     if len(bins) <= 1:
         return moves, []
 
-    target = bins.iloc[-1]["Bin"]
+    target_bin = bins.iloc[-1]["Bin"]
     freed_bins = []
 
     for i in range(len(bins) - 1):
         src = bins.iloc[i]
         moves.append([
             src["Bin"], "",
-            src["SKU"], src["Batch"],
+            batch_row["SKU"], batch_row["Batch"],
             "Good", "L0",
-            src["Qty"], target, ""
+            src["Qty"], target_bin, ""
         ])
         freed_bins.append(src["Bin"])
 
@@ -149,16 +135,18 @@ def distribute_batch(batch_row, wms_bins, empty_bins):
     moves = []
 
     src = wms_bins[
-        (wms_bins["Product"] == batch_row["Product"]) &
+        (wms_bins["SKU"] == batch_row["SKU"]) &
         (wms_bins["Batch"] == batch_row["Batch"])
     ].sort_values("Qty", ascending=False).iloc[0]
 
-    per_bin_qty = max(1, int(src["Qty"] / len(empty_bins)))
+    per_bin_qty = max(
+        1, int(batch_row["Quantity"] / len(empty_bins))
+    )
 
     for b in empty_bins:
         moves.append([
             src["Bin"], "",
-            src["SKU"], src["Batch"],
+            batch_row["SKU"], batch_row["Batch"],
             "Good", "L0",
             per_bin_qty, b, ""
         ])
@@ -170,80 +158,59 @@ def distribute_batch(batch_row, wms_bins, empty_bins):
 # MAIN ENGINE
 # ==================================================
 
-def generate_ims(decision, wms_bins, sku_map):
+def generate_ims(ptl, wms_bins, wms_summary, sku_map):
     ims = []
     diagnostics = []
 
-    for sku, sku_df in decision.groupby("Product Code"):
+    for _, row in ptl.iterrows():
 
+        sku = row["SKU"]
+        batch = row["Batch"]
+        required = row["Required_Zones"]
+
+        current = wms_summary[
+            (wms_summary["SKU"] == sku) &
+            (wms_summary["Batch"] == batch)
+        ]
+
+        bin_count = int(current["Bin_Count"].iloc[0]) if not current.empty else 0
+
+        # Find empty bins
         allowed_bins = set(
-            sku_map[sku_map["Product"] == sku]["Bin"]
+            sku_map["Bin"]
         )
-
         used_bins = set(
-            wms_bins[wms_bins["Product"] == sku]["Bin"]
+            wms_bins[
+                (wms_bins["SKU"] == sku) &
+                (wms_bins["Batch"] == batch)
+            ]["Bin"]
         )
 
         empty_bins = list(allowed_bins - used_bins)
 
-        target_batches = sku_df[
-            sku_df["Alloc_Priority"] == 1
-        ].sort_values("Required_Zones", ascending=False)
+        if bin_count >= required:
+            diagnostics.append((sku, batch, "NO ACTION – sufficient bins"))
+            continue
 
-        for _, target in target_batches.iterrows():
+        if empty_bins:
+            ims += distribute_batch(row, wms_bins, empty_bins[:1])
+            diagnostics.append((sku, batch, "DISTRIBUTED using empty bin"))
+            continue
 
-            if target["Bin_Count"] >= target["Required_Zones"]:
-                diagnostics.append((sku, target["Batch"], "Already sufficient"))
-                continue
-
-            if empty_bins:
-                ims += distribute_batch(target, wms_bins, empty_bins[:1])
-                diagnostics.append((sku, target["Batch"], "Used empty bin"))
-                continue
-
-            # Priority 1: over-spread batches
-            candidates = sku_df[
-                (sku_df["Batch"] != target["Batch"]) &
-                (sku_df["Bin_Count"] > sku_df["Required_Zones"])
-            ]
-
-            freed = False
-            for _, c in candidates.iterrows():
-                cons, freed_bins = consolidate_batch(c, wms_bins)
-                if freed_bins:
-                    ims += cons
-                    ims += distribute_batch(target, wms_bins, freed_bins[:1])
-                    diagnostics.append((sku, target["Batch"], f"Freed from {c['Batch']}"))
-                    freed = True
-                    break
-
-            if freed:
-                continue
-
-            # Priority 2: non-allocating batches
-            fallback = sku_df[
-                (sku_df["Batch"] != target["Batch"]) &
-                (sku_df["Alloc_Priority"] == 0) &
-                (sku_df["Bin_Count"] > 1)
-            ]
-
-            for _, c in fallback.iterrows():
-                cons, freed_bins = consolidate_batch(c, wms_bins)
-                if freed_bins:
-                    ims += cons
-                    ims += distribute_batch(target, wms_bins, freed_bins[:1])
-                    diagnostics.append((sku, target["Batch"], f"Freed from non-alloc {c['Batch']}"))
-                    freed = True
-                    break
-
-            if not freed:
-                diagnostics.append((sku, target["Batch"], "MANUAL INTERVENTION"))
+        # Try consolidation (same SKU–Batch)
+        cons, freed = consolidate_batch(row, wms_bins)
+        if freed:
+            ims += cons
+            ims += distribute_batch(row, wms_bins, freed[:1])
+            diagnostics.append((sku, batch, "CONSOLIDATED → DISTRIBUTED"))
+        else:
+            diagnostics.append((sku, batch, "MANUAL INTERVENTION REQUIRED"))
 
     return ims, diagnostics
 
 
 # ==================================================
-# STREAMLIT UI
+# UI
 # ==================================================
 
 st.sidebar.header("📂 Upload Files")
@@ -255,17 +222,15 @@ sku_file = st.sidebar.file_uploader("SKU–Bin Mapping File", type="xlsx")
 
 run = st.sidebar.button("▶ Run Engine")
 
-if run and all([ptl_file, sap_file, wms_file, sku_file]):
+if run and all([ptl_file, wms_file, sku_file]):
 
     ptl = load_ptl_demand(ptl_file)
-    sap = load_sap_inventory(sap_file)
     wms = load_wms_inventory(wms_file)
     sku_map = load_sku_master(sku_file)
 
     wms_bins, wms_summary = build_wms_state(wms)
-    decision = build_decision(ptl, sap, wms_summary)
 
-    ims, diag = generate_ims(decision, wms_bins, sku_map)
+    ims, diag = generate_ims(ptl, wms_bins, wms_summary, sku_map)
 
     im_df = pd.DataFrame(ims, columns=[
         "Source Bin", "HU Code", "SKU", "Batch",
@@ -273,22 +238,27 @@ if run and all([ptl_file, sap_file, wms_file, sku_file]):
         "Destination Bin", "Pick HU"
     ])
 
-    diag_df = pd.DataFrame(diag, columns=["Product", "Batch", "Outcome"])
+    diag_df = pd.DataFrame(diag, columns=["SKU", "Batch", "Decision"])
 
-    st.subheader("📊 Diagnostics")
+    # ================= DASHBOARD =================
+    st.subheader("📊 Decision Dashboard")
     st.dataframe(diag_df, use_container_width=True)
 
-    st.subheader("📄 Generated IMs")
-    st.success(f"Total IM rows generated: {len(im_df)}")
+    # ================= PREVIEW ===================
+    st.subheader("👀 IM Preview (Before Download)")
     st.dataframe(im_df, use_container_width=True)
 
-    out = BytesIO()
-    im_df.to_excel(out, index=False)
-    out.seek(0)
+    # ================= DOWNLOAD ==================
+    st.subheader("⬇ Download IM File")
+    st.success(f"Total IM rows generated: {len(im_df)}")
+
+    output = BytesIO()
+    im_df.to_excel(output, index=False)
+    output.seek(0)
 
     st.download_button(
-        "⬇ Download IM File",
-        data=out,
+        "Download IM Excel",
+        data=output,
         file_name="IM_Final.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
