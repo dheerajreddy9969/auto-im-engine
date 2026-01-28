@@ -8,7 +8,7 @@ from io import BytesIO
 # ==================================================
 st.set_page_config(page_title="PTL IM Engine", layout="wide")
 st.title("📦 PTL Internal Movement (IM) Engine")
-st.caption("SAP-aware | WMS-driven | Diagnostics enabled")
+st.caption("Priority-driven | Batch-safe | Space-aware")
 
 # ==================================================
 # LOADERS
@@ -32,15 +32,10 @@ def load_sap_inventory(file):
         qty_col: "Available_Qty"
     })
 
-    sap["ATP_Priority"] = sap["ATP_Type"].map({
-        "ATP_PICK": 0,
-        "ATP_RESERVE": 1
+    sap["Alloc_Priority"] = sap["ATP_Type"].map({
+        "ATP_PICK": 1,
+        "ATP_RESERVE": 0
     })
-
-    sap = sap.sort_values(
-        ["Product", "ATP_Priority", "expiryDate"],
-        ascending=[True, True, True]
-    )
 
     return sap
 
@@ -57,12 +52,10 @@ def load_wms_inventory(file):
         "Product", "SKU", "Batch", "Qty"
     ]
 
-    # --- FIX: Zone numeric ---
     wms["Zone"] = pd.to_numeric(wms["Zone"], errors="coerce")
     wms = wms.dropna(subset=["Zone"])
     wms["Zone"] = wms["Zone"].astype(int)
 
-    # --- Business filters ---
     wms = wms[
         (wms["Area"] == "PTL") &
         (wms["Zone"] <= 8) &
@@ -79,27 +72,31 @@ def load_sku_master(file):
 
 
 # ==================================================
-# CORE STATE BUILD
+# STATE BUILDERS
 # ==================================================
 
 def build_wms_state(wms):
-    wms_bins = (
+    bins = (
         wms.groupby(["Product", "SKU", "Batch", "Bin"], as_index=False)
         .agg(Qty=("Qty", "sum"))
     )
 
-    wms_summary = (
-        wms_bins.groupby(["Product", "Batch"], as_index=False)
+    summary = (
+        bins.groupby(["Product", "Batch"], as_index=False)
         .agg(
-            WMS_Bin_Count=("Bin", "nunique"),
-            WMS_Total_Qty=("Qty", "sum")
+            Bin_Count=("Bin", "nunique"),
+            Total_Qty=("Qty", "sum")
         )
     )
 
-    return wms_bins, wms_summary
+    return bins, summary
 
 
-def build_decision_table(ptl, wms_summary):
+# ==================================================
+# CORE DECISION ENGINE
+# ==================================================
+
+def build_decision(ptl, sap, wms_summary):
     decision = ptl.merge(
         wms_summary,
         left_on="Product Code",
@@ -107,136 +104,142 @@ def build_decision_table(ptl, wms_summary):
         how="inner"
     )
 
-    decision["Action"] = "NO ACTION"
+    decision = decision.merge(
+        sap[["Product", "Batch", "Alloc_Priority"]],
+        on=["Product", "Batch"],
+        how="left"
+    ).fillna({"Alloc_Priority": 0})
 
-    decision.loc[
-        decision["WMS_Bin_Count"] > decision["Required_Zones"],
-        "Action"
-    ] = "CONSOLIDATE"
-
-    decision.loc[
-        decision["WMS_Bin_Count"] < decision["Required_Zones"],
-        "Action"
-    ] = "DISTRIBUTE"
+    decision["Status"] = "NO ACTION"
 
     return decision
 
 
 # ==================================================
-# ERROR DETECTION
+# IM GENERATION HELPERS
 # ==================================================
 
-def detect_errors(decision, wms_bins, sku_map):
-    error_reason = []
+def consolidate_batch(batch_row, wms_bins):
+    moves = []
+    bins = wms_bins[
+        (wms_bins["Product"] == batch_row["Product"]) &
+        (wms_bins["Batch"] == batch_row["Batch"])
+    ].sort_values("Qty")
 
-    for _, r in decision.iterrows():
-        error = ""
+    if len(bins) <= 1:
+        return moves, []
 
-        if r["Action"] == "DISTRIBUTE":
-            allowed_bins = sku_map[
-                sku_map["Product"] == r["Product Code"]
-            ]["Bin"]
+    target = bins.iloc[-1]["Bin"]
+    freed_bins = []
 
-            used_bins = wms_bins[
-                (wms_bins["Product"] == r["Product Code"]) &
-                (wms_bins["Batch"] == r["Batch"])
-            ]["Bin"]
+    for i in range(len(bins) - 1):
+        src = bins.iloc[i]
+        moves.append([
+            src["Bin"], "",
+            src["SKU"], src["Batch"],
+            "Good", "L0",
+            src["Qty"], target, ""
+        ])
+        freed_bins.append(src["Bin"])
 
-            if len(set(allowed_bins) - set(used_bins)) == 0:
-                error = "No empty bins available"
+    return moves, freed_bins
 
-        error_reason.append(error)
 
-    decision["Error_Reason"] = error_reason
-    decision["Error_Flag"] = decision["Error_Reason"].apply(
-        lambda x: "YES" if x else "NO"
-    )
+def distribute_batch(batch_row, wms_bins, empty_bins):
+    moves = []
 
-    return decision
+    src = wms_bins[
+        (wms_bins["Product"] == batch_row["Product"]) &
+        (wms_bins["Batch"] == batch_row["Batch"])
+    ].sort_values("Qty", ascending=False).iloc[0]
+
+    per_bin_qty = max(1, int(src["Qty"] / len(empty_bins)))
+
+    for b in empty_bins:
+        moves.append([
+            src["Bin"], "",
+            src["SKU"], src["Batch"],
+            "Good", "L0",
+            per_bin_qty, b, ""
+        ])
+
+    return moves
 
 
 # ==================================================
-# IM GENERATION
+# MAIN ENGINE
 # ==================================================
 
-def generate_consolidation_ims(decision, wms_bins):
-    rows = []
+def generate_ims(decision, wms_bins, sku_map):
+    ims = []
+    diagnostics = []
 
-    for _, r in decision.iterrows():
-        if r["Action"] != "CONSOLIDATE" or r["Error_Flag"] == "YES":
-            continue
+    for sku, sku_df in decision.groupby("Product Code"):
 
-        bins = wms_bins[
-            (wms_bins["Product"] == r["Product Code"]) &
-            (wms_bins["Batch"] == r["Batch"])
-        ].sort_values("Qty")
+        allowed_bins = set(
+            sku_map[sku_map["Product"] == sku]["Bin"]
+        )
 
-        excess = int(r["WMS_Bin_Count"] - r["Required_Zones"])
-        if excess <= 0 or bins.empty:
-            continue
+        used_bins = set(
+            wms_bins[wms_bins["Product"] == sku]["Bin"]
+        )
 
-        target = bins.iloc[-1]
+        empty_bins = list(allowed_bins - used_bins)
 
-        for i in range(excess):
-            src = bins.iloc[i]
-            rows.append([
-                src["Bin"], "",
-                src["SKU"], r["Batch"],
-                "Good", "L0",
-                src["Qty"],
-                target["Bin"],
-                ""
-            ])
+        target_batches = sku_df[
+            sku_df["Alloc_Priority"] == 1
+        ].sort_values("Required_Zones", ascending=False)
 
-    return rows
+        for _, target in target_batches.iterrows():
 
+            if target["Bin_Count"] >= target["Required_Zones"]:
+                diagnostics.append((sku, target["Batch"], "Already sufficient"))
+                continue
 
-def generate_distribution_ims(decision, wms_bins, sku_map):
-    rows = []
+            if empty_bins:
+                ims += distribute_batch(target, wms_bins, empty_bins[:1])
+                diagnostics.append((sku, target["Batch"], "Used empty bin"))
+                continue
 
-    for _, r in decision.iterrows():
-        if r["Action"] != "DISTRIBUTE" or r["Error_Flag"] == "YES":
-            continue
+            # Priority 1: over-spread batches
+            candidates = sku_df[
+                (sku_df["Batch"] != target["Batch"]) &
+                (sku_df["Bin_Count"] > sku_df["Required_Zones"])
+            ]
 
-        needed = int(r["Required_Zones"] - r["WMS_Bin_Count"])
-        if needed <= 0:
-            continue
+            freed = False
+            for _, c in candidates.iterrows():
+                cons, freed_bins = consolidate_batch(c, wms_bins)
+                if freed_bins:
+                    ims += cons
+                    ims += distribute_batch(target, wms_bins, freed_bins[:1])
+                    diagnostics.append((sku, target["Batch"], f"Freed from {c['Batch']}"))
+                    freed = True
+                    break
 
-        allowed_bins = sku_map[
-            sku_map["Product"] == r["Product Code"]
-        ]["Bin"]
+            if freed:
+                continue
 
-        used_bins = wms_bins[
-            (wms_bins["Product"] == r["Product Code"]) &
-            (wms_bins["Batch"] == r["Batch"])
-        ]["Bin"]
+            # Priority 2: non-allocating batches
+            fallback = sku_df[
+                (sku_df["Batch"] != target["Batch"]) &
+                (sku_df["Alloc_Priority"] == 0) &
+                (sku_df["Bin_Count"] > 1)
+            ]
 
-        empty_bins = list(set(allowed_bins) - set(used_bins))
-        if not empty_bins:
-            continue
+            for _, c in fallback.iterrows():
+                cons, freed_bins = consolidate_batch(c, wms_bins)
+                if freed_bins:
+                    ims += cons
+                    ims += distribute_batch(target, wms_bins, freed_bins[:1])
+                    diagnostics.append((sku, target["Batch"], f"Freed from non-alloc {c['Batch']}"))
+                    freed = True
+                    break
 
-        src_bins = wms_bins[
-            (wms_bins["Product"] == r["Product Code"]) &
-            (wms_bins["Batch"] == r["Batch"])
-        ]
+            if not freed:
+                diagnostics.append((sku, target["Batch"], "MANUAL INTERVENTION"))
 
-        if src_bins.empty:
-            continue
-
-        src = src_bins.sort_values("Qty", ascending=False).iloc[0]
-        per_bin_qty = max(1, int(src["Qty"] / needed))
-
-        for b in empty_bins[:needed]:
-            rows.append([
-                src["Bin"], "",
-                src["SKU"], r["Batch"],
-                "Good", "L0",
-                per_bin_qty,
-                b,
-                ""
-            ])
-
-    return rows
+    return ims, diagnostics
 
 
 # ==================================================
@@ -250,14 +253,9 @@ sap_file = st.sidebar.file_uploader("SAP Inventory File", type="xlsx")
 wms_file = st.sidebar.file_uploader("WMS Inventory File", type="xlsx")
 sku_file = st.sidebar.file_uploader("SKU–Bin Mapping File", type="xlsx")
 
-run_analysis = st.sidebar.button("🔍 Run Analysis")
-generate_im = st.sidebar.button("🚚 Generate IM")
+run = st.sidebar.button("▶ Run Engine")
 
-# ==================================================
-# RUN ANALYSIS
-# ==================================================
-
-if run_analysis and all([ptl_file, sap_file, wms_file, sku_file]):
+if run and all([ptl_file, sap_file, wms_file, sku_file]):
 
     ptl = load_ptl_demand(ptl_file)
     sap = load_sap_inventory(sap_file)
@@ -265,95 +263,32 @@ if run_analysis and all([ptl_file, sap_file, wms_file, sku_file]):
     sku_map = load_sku_master(sku_file)
 
     wms_bins, wms_summary = build_wms_state(wms)
-    decision = build_decision_table(ptl, wms_summary)
-    decision = detect_errors(decision, wms_bins, sku_map)
+    decision = build_decision(ptl, sap, wms_summary)
 
-    st.session_state.decision = decision
-    st.session_state.wms_bins = wms_bins
-    st.session_state.sku_map = sku_map
-    st.session_state.sap = sap
+    ims, diag = generate_ims(decision, wms_bins, sku_map)
 
-# ==================================================
-# DASHBOARD + DIAGNOSTICS
-# ==================================================
+    im_df = pd.DataFrame(ims, columns=[
+        "Source Bin", "HU Code", "SKU", "Batch",
+        "Quality", "UOM", "Quantity",
+        "Destination Bin", "Pick HU"
+    ])
 
-if "decision" in st.session_state:
+    diag_df = pd.DataFrame(diag, columns=["Product", "Batch", "Outcome"])
 
-    d = st.session_state.decision
+    st.subheader("📊 Diagnostics")
+    st.dataframe(diag_df, use_container_width=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("SKU–Batches", len(d))
-    c2.metric("Consolidate", (d.Action == "CONSOLIDATE").sum())
-    c3.metric("Distribute", (d.Action == "DISTRIBUTE").sum())
-    c4.metric("Errors", (d.Error_Flag == "YES").sum())
+    st.subheader("📄 Generated IMs")
+    st.success(f"Total IM rows generated: {len(im_df)}")
+    st.dataframe(im_df, use_container_width=True)
 
-    st.subheader("📋 Decision Table")
-    st.dataframe(d, use_container_width=True)
-
-    # -------- DIAGNOSTICS --------
-    st.subheader("🧪 IM Trigger Diagnostics")
-
-    cons_diag = d[d.WMS_Bin_Count > d.Required_Zones]
-    dist_diag = d[d.WMS_Bin_Count < d.Required_Zones]
-
-    st.markdown("### 🔹 Consolidation Candidates")
-    st.write(cons_diag[["Product Code","Batch","WMS_Bin_Count","Required_Zones"]])
-
-    st.markdown("### 🔹 Distribution Candidates")
-    st.write(dist_diag[["Product Code","Batch","WMS_Bin_Count","Required_Zones"]])
-
-    st.markdown("### 🔹 NO ACTION (Balanced)")
-    st.write(
-        d[d.Action == "NO ACTION"]
-        [["Product Code","Batch","WMS_Bin_Count","Required_Zones"]]
-    )
-
-    if (d.Error_Flag == "YES").any():
-        st.subheader("⚠️ Error Records (Blocked IMs)")
-        st.write(d[d.Error_Flag == "YES"]
-                 [["Product Code","Batch","Action","Error_Reason"]])
-
-# ==================================================
-# IM FILE GENERATION
-# ==================================================
-
-if generate_im and "decision" in st.session_state:
-
-    cons = generate_consolidation_ims(
-        st.session_state.decision,
-        st.session_state.wms_bins
-    )
-
-    dist = generate_distribution_ims(
-        st.session_state.decision,
-        st.session_state.wms_bins,
-        st.session_state.sku_map
-    )
-
-    im_df = pd.DataFrame(
-        cons + dist,
-        columns=[
-            "Source Bin",
-            "HU Code",
-            "SKU",
-            "Batch",
-            "Quality",
-            "UOM",
-            "Quantity",
-            "Destination Bin",
-            "Pick HU"
-        ]
-    )
-
-    st.success(f"IM rows generated: {len(im_df)}")
-
-    output = BytesIO()
-    im_df.to_excel(output, index=False)
-    output.seek(0)
+    out = BytesIO()
+    im_df.to_excel(out, index=False)
+    out.seek(0)
 
     st.download_button(
-        "⬇️ Download IM File",
-        data=output,
+        "⬇ Download IM File",
+        data=out,
         file_name="IM_Final.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
