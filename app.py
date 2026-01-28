@@ -6,48 +6,18 @@ from io import BytesIO
 # ==================================================
 # PAGE CONFIG
 # ==================================================
-st.set_page_config(
-    page_title="PTL Internal Movement Engine",
-    layout="wide"
-)
-
+st.set_page_config(page_title="PTL IM Engine", layout="wide")
 st.title("📦 PTL Internal Movement (IM) Engine")
-st.caption("Demand-driven | Batch-aware | Pick-face optimized")
+st.caption("Consolidation first → Balancing next | WMS-driven execution")
 
 # ==================================================
-# DATA LOAD FUNCTIONS
+# LOADERS
 # ==================================================
 
 def load_ptl_demand(file):
     df = pd.read_excel(file)
     df["Required_Zones"] = df["Lines"].apply(lambda x: math.ceil(x / 60))
     return df
-
-
-def load_sap_inventory(file):
-    sap = pd.read_excel(file, sheet_name="batch mapping")
-
-    qty_col = sap.columns[16]  # Column Q
-
-    sap = sap.rename(columns={
-        "product": "Product",
-        "sku": "SKU",
-        "batch": "Batch",
-        "type": "Type",
-        qty_col: "Available_Qty"
-    })
-
-    sap["Priority"] = sap["Type"].map({
-        "ATP_PICK": 0,
-        "ATP_RESERVE": 1
-    })
-
-    sap = sap.sort_values(
-        ["Product", "Priority", "expiryDate"],
-        ascending=[True, True, True]
-    )
-
-    return sap
 
 
 def load_wms_inventory(file):
@@ -62,12 +32,12 @@ def load_wms_inventory(file):
         "Product", "SKU", "Batch", "Qty"
     ]
 
-    # 🔑 CRITICAL FIX — Zone must be numeric
+    # --- FIX: Zone numeric ---
     wms["Zone"] = pd.to_numeric(wms["Zone"], errors="coerce")
     wms = wms.dropna(subset=["Zone"])
     wms["Zone"] = wms["Zone"].astype(int)
 
-    # Apply business filters
+    # --- Filters ---
     wms = wms[
         (wms["Area"] == "PTL") &
         (wms["Zone"] <= 8) &
@@ -84,35 +54,38 @@ def load_sku_master(file):
 
 
 # ==================================================
-# CORE LOGIC
+# CORE STATE BUILD
 # ==================================================
 
 def build_wms_state(wms):
     wms_bins = (
-        wms.groupby(["Product", "SKU", "Batch", "Bin"])
+        wms.groupby(["Product", "SKU", "Batch", "Bin"], as_index=False)
         .agg(Qty=("Qty", "sum"))
-        .reset_index()
     )
 
-    summary = (
-        wms_bins.groupby(["Product", "SKU", "Batch"])
+    wms_summary = (
+        wms_bins.groupby(["Product", "Batch"], as_index=False)
         .agg(
             WMS_Bin_Count=("Bin", "nunique"),
             WMS_Total_Qty=("Qty", "sum")
         )
-        .reset_index()
     )
 
-    return wms_bins, summary
+    return wms_bins, wms_summary
 
 
 def build_decision_table(ptl, wms_summary):
+    """
+    Decision table MUST contain Batch.
+    We join PTL → WMS summary at Product level,
+    then operate per Product–Batch.
+    """
     decision = ptl.merge(
         wms_summary,
-        left_on=["Product Code", "Sku-batch"],
-        right_on=["Product", "SKU"],
-        how="left"
-    ).fillna(0)
+        left_on="Product Code",
+        right_on="Product",
+        how="inner"   # important
+    )
 
     decision["Action"] = "NO ACTION"
 
@@ -134,7 +107,7 @@ def build_decision_table(ptl, wms_summary):
 # ==================================================
 
 def detect_errors(decision, wms_bins, sku_map):
-    errors = []
+    error_reason = []
 
     for _, r in decision.iterrows():
         error = ""
@@ -149,14 +122,12 @@ def detect_errors(decision, wms_bins, sku_map):
                 (wms_bins["Batch"] == r["Batch"])
             ]["Bin"]
 
-            empty_bins = set(allowed_bins) - set(used_bins)
-
-            if not empty_bins:
+            if len(set(allowed_bins) - set(used_bins)) == 0:
                 error = "No empty bins available"
 
-        errors.append(error)
+        error_reason.append(error)
 
-    decision["Error_Reason"] = errors
+    decision["Error_Reason"] = error_reason
     decision["Error_Flag"] = decision["Error_Reason"].apply(
         lambda x: "YES" if x else "NO"
     )
@@ -177,7 +148,6 @@ def generate_consolidation_ims(decision, wms_bins):
 
         bins = wms_bins[
             (wms_bins["Product"] == r["Product Code"]) &
-            (wms_bins["SKU"] == r["Sku-batch"]) &
             (wms_bins["Batch"] == r["Batch"])
         ].sort_values("Qty")
 
@@ -185,15 +155,18 @@ def generate_consolidation_ims(decision, wms_bins):
         if excess <= 0 or bins.empty:
             continue
 
-        target_bin = bins.iloc[-1]["Bin"]
+        target_bin = bins.iloc[-1]
 
         for i in range(excess):
             src = bins.iloc[i]
+
             rows.append([
                 src["Bin"], "",
-                r["Sku-batch"], r["Batch"],
+                src["SKU"], r["Batch"],
                 "Good", "L0",
-                src["Qty"], target_bin, ""
+                src["Qty"],
+                target_bin["Bin"],
+                ""
             ])
 
     return rows
@@ -232,14 +205,16 @@ def generate_distribution_ims(decision, wms_bins, sku_map):
             continue
 
         src = src_bins.sort_values("Qty", ascending=False).iloc[0]
-        per_bin_qty = max(1, int(r["Quantity"] / needed))
+        per_bin_qty = max(1, int(src["Qty"] / needed))
 
         for b in empty_bins[:needed]:
             rows.append([
                 src["Bin"], "",
-                r["Sku-batch"], r["Batch"],
+                src["SKU"], r["Batch"],
                 "Good", "L0",
-                per_bin_qty, b, ""
+                per_bin_qty,
+                b,
+                ""
             ])
 
     return rows
@@ -252,7 +227,6 @@ def generate_distribution_ims(decision, wms_bins, sku_map):
 st.sidebar.header("📂 Upload Files")
 
 ptl_file = st.sidebar.file_uploader("PTL Demand File", type="xlsx")
-sap_file = st.sidebar.file_uploader("SAP Inventory File", type="xlsx")
 wms_file = st.sidebar.file_uploader("WMS Inventory File", type="xlsx")
 sku_file = st.sidebar.file_uploader("SKU–Bin Mapping File", type="xlsx")
 
@@ -260,13 +234,12 @@ run_analysis = st.sidebar.button("🔍 Run Analysis")
 generate_im = st.sidebar.button("🚚 Generate IM")
 
 # ==================================================
-# RUN ANALYSIS
+# ANALYSIS
 # ==================================================
 
-if run_analysis and all([ptl_file, sap_file, wms_file, sku_file]):
+if run_analysis and all([ptl_file, wms_file, sku_file]):
 
     ptl = load_ptl_demand(ptl_file)
-    sap = load_sap_inventory(sap_file)  # reserved for future use
     wms = load_wms_inventory(wms_file)
     sku_map = load_sku_master(sku_file)
 
@@ -300,7 +273,7 @@ if "decision" in st.session_state:
         st.dataframe(d[d.Error_Flag == "YES"])
 
 # ==================================================
-# GENERATE IM
+# IM FILE GENERATION
 # ==================================================
 
 if generate_im and "decision" in st.session_state:
@@ -319,11 +292,19 @@ if generate_im and "decision" in st.session_state:
     im_df = pd.DataFrame(
         cons + dist,
         columns=[
-            "Source Bin", "HU Code", "SKU", "Batch",
-            "Quality", "UOM", "Quantity",
-            "Destination Bin", "Pick HU"
+            "Source Bin",
+            "HU Code",
+            "SKU",
+            "Batch",
+            "Quality",
+            "UOM",
+            "Quantity",
+            "Destination Bin",
+            "Pick HU"
         ]
     )
+
+    st.success(f"IM rows generated: {len(im_df)}")
 
     output = BytesIO()
     im_df.to_excel(output, index=False)
