@@ -8,7 +8,7 @@ from io import BytesIO
 # ==================================================
 st.set_page_config(page_title="PTL IM Engine", layout="wide")
 st.title("📦 PTL Internal Movement (IM) Engine")
-st.caption("Consolidation first → Balancing next | WMS-driven execution")
+st.caption("SAP-aware | WMS-driven | Consolidation → Balancing")
 
 # ==================================================
 # LOADERS
@@ -18,6 +18,38 @@ def load_ptl_demand(file):
     df = pd.read_excel(file)
     df["Required_Zones"] = df["Lines"].apply(lambda x: math.ceil(x / 60))
     return df
+
+
+def load_sap_inventory(file):
+    """
+    SAP inventory is NOT directly used for IM execution yet,
+    but is loaded, validated, and kept ready for:
+    - batch prioritisation
+    - future allocation logic
+    """
+    sap = pd.read_excel(file, sheet_name="batch mapping")
+
+    qty_col = sap.columns[16]  # Column Q as per your rule
+
+    sap = sap.rename(columns={
+        "product": "Product",
+        "sku": "SKU",
+        "batch": "Batch",
+        "type": "ATP_Type",
+        qty_col: "Available_Qty"
+    })
+
+    sap["ATP_Priority"] = sap["ATP_Type"].map({
+        "ATP_PICK": 0,
+        "ATP_RESERVE": 1
+    })
+
+    sap = sap.sort_values(
+        ["Product", "ATP_Priority", "expiryDate"],
+        ascending=[True, True, True]
+    )
+
+    return sap
 
 
 def load_wms_inventory(file):
@@ -32,12 +64,12 @@ def load_wms_inventory(file):
         "Product", "SKU", "Batch", "Qty"
     ]
 
-    # --- FIX: Zone numeric ---
+    # ---- FIX: Zone must be numeric ----
     wms["Zone"] = pd.to_numeric(wms["Zone"], errors="coerce")
     wms = wms.dropna(subset=["Zone"])
     wms["Zone"] = wms["Zone"].astype(int)
 
-    # --- Filters ---
+    # ---- Business filters ----
     wms = wms[
         (wms["Area"] == "PTL") &
         (wms["Zone"] <= 8) &
@@ -76,15 +108,14 @@ def build_wms_state(wms):
 
 def build_decision_table(ptl, wms_summary):
     """
-    Decision table MUST contain Batch.
-    We join PTL → WMS summary at Product level,
-    then operate per Product–Batch.
+    Decision table is Product–Batch based.
+    Required_Zones comes from PTL demand.
     """
     decision = ptl.merge(
         wms_summary,
         left_on="Product Code",
         right_on="Product",
-        how="inner"   # important
+        how="inner"
     )
 
     decision["Action"] = "NO ACTION"
@@ -155,17 +186,16 @@ def generate_consolidation_ims(decision, wms_bins):
         if excess <= 0 or bins.empty:
             continue
 
-        target_bin = bins.iloc[-1]
+        target = bins.iloc[-1]
 
         for i in range(excess):
             src = bins.iloc[i]
-
             rows.append([
                 src["Bin"], "",
                 src["SKU"], r["Batch"],
                 "Good", "L0",
                 src["Qty"],
-                target_bin["Bin"],
+                target["Bin"],
                 ""
             ])
 
@@ -227,6 +257,7 @@ def generate_distribution_ims(decision, wms_bins, sku_map):
 st.sidebar.header("📂 Upload Files")
 
 ptl_file = st.sidebar.file_uploader("PTL Demand File", type="xlsx")
+sap_file = st.sidebar.file_uploader("SAP Inventory File", type="xlsx")
 wms_file = st.sidebar.file_uploader("WMS Inventory File", type="xlsx")
 sku_file = st.sidebar.file_uploader("SKU–Bin Mapping File", type="xlsx")
 
@@ -234,12 +265,13 @@ run_analysis = st.sidebar.button("🔍 Run Analysis")
 generate_im = st.sidebar.button("🚚 Generate IM")
 
 # ==================================================
-# ANALYSIS
+# RUN ANALYSIS
 # ==================================================
 
-if run_analysis and all([ptl_file, wms_file, sku_file]):
+if run_analysis and all([ptl_file, sap_file, wms_file, sku_file]):
 
     ptl = load_ptl_demand(ptl_file)
+    sap = load_sap_inventory(sap_file)     # ✅ SAP LOADED
     wms = load_wms_inventory(wms_file)
     sku_map = load_sku_master(sku_file)
 
@@ -247,9 +279,11 @@ if run_analysis and all([ptl_file, wms_file, sku_file]):
     decision = build_decision_table(ptl, wms_summary)
     decision = detect_errors(decision, wms_bins, sku_map)
 
+    # Store in session
     st.session_state.decision = decision
     st.session_state.wms_bins = wms_bins
     st.session_state.sku_map = sku_map
+    st.session_state.sap = sap   # kept for future logic
 
 # ==================================================
 # DASHBOARD
