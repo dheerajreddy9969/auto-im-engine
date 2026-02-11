@@ -1,271 +1,188 @@
 import streamlit as st
 import pandas as pd
-import math
 from io import BytesIO
 
-# ==================================================
-# PAGE CONFIG
-# ==================================================
-st.set_page_config(page_title="PTL IM Engine", layout="wide")
-st.title("📦 PTL Internal Movement (IM) Engine")
-st.caption("PTL-driven | SKU–Batch accurate | Preview before execution")
+TOTAL_BINS_PER_BASEPACK = 8
 
-# ==================================================
-# LOADERS
-# ==================================================
 
-def load_ptl_demand(file):
-    """
-    PTL Demand:
-    Column B = SKU
-    Column C = Batch
-    Lines & Quantity are SKU–Batch specific
-    """
-    df = pd.read_excel(file)
+# -----------------------------
+# READ EXCEL
+# -----------------------------
+def read_excel(file):
 
-    df = df.rename(columns={
-        df.columns[1]: "SKU",      # Column B
-        df.columns[2]: "Batch",    # Column C
-        df.columns[3]: "Quantity",
-        df.columns[4]: "Lines"
-    })
+    xls = pd.ExcelFile(file)
 
-    df["Required_Zones"] = df["Lines"].apply(
-        lambda x: math.ceil(x / 60)
+    demand = pd.read_excel(xls, "PTL Demand")
+    sap = pd.read_excel(xls, "SAP Inventory")
+    ptl = pd.read_excel(xls, "PTL Inventory")
+
+    demand = demand.iloc[:, [0, 2]]
+    demand.columns = ["SKU", "Demand Qty"]
+
+    sap = sap.iloc[:, [1, 2, 3, 14, 17]]
+    sap.columns = ["SKU", "Batch", "Stock Type", "Expiry Date", "Qty"]
+
+    ptl = ptl.iloc[:, [1, 4, 12, 13, 17]]
+    ptl.columns = ["Area Type", "Bin Code", "BASEPACK", "SKU", "Batch"]
+
+    return demand, sap, ptl
+
+
+# -----------------------------
+# BUILD BASEPACK MAP
+# -----------------------------
+def build_basepack_map(ptl):
+
+    ptl = ptl[ptl["Area Type"] == "PTL"]
+
+    return dict(zip(ptl["SKU"], ptl["BASEPACK"]))
+
+
+# -----------------------------
+# FEFO ALLOCATION
+# -----------------------------
+def fefo_allocate(demand, sap, basepack_map):
+
+    allocations = []
+
+    top20 = demand.head(20)
+
+    for _, row in top20.iterrows():
+
+        sku = row["SKU"]
+        demand_qty = row["Demand Qty"]
+
+        sap_filtered = sap[
+            (sap["SKU"] == sku) &
+            (sap["Stock Type"] == "ATP_PICK")
+        ].copy()
+
+        sap_filtered = sap_filtered.sort_values("Expiry Date")
+
+        remaining = demand_qty
+
+        for _, srow in sap_filtered.iterrows():
+
+            if remaining <= 0:
+                break
+
+            allocate = min(remaining, srow["Qty"])
+
+            allocations.append({
+                "BASEPACK": basepack_map.get(sku, "UNKNOWN"),
+                "SKU": sku,
+                "Batch": srow["Batch"],
+                "Allocated Qty": allocate
+            })
+
+            remaining -= allocate
+
+    return pd.DataFrame(allocations)
+
+
+# -----------------------------
+# BIN CALCULATION
+# -----------------------------
+def calculate_bins(df):
+
+    results = []
+
+    for basepack, group in df.groupby("BASEPACK"):
+
+        total = group["Allocated Qty"].sum()
+
+        group = group.copy()
+
+        group["Bins Needed"] = (
+            group["Allocated Qty"] / total * TOTAL_BINS_PER_BASEPACK
+        ).round()
+
+        diff = TOTAL_BINS_PER_BASEPACK - group["Bins Needed"].sum()
+
+        if diff != 0:
+            idx = group["Allocated Qty"].idxmax()
+            group.loc[idx, "Bins Needed"] += diff
+
+        results.append(group)
+
+    return pd.concat(results)
+
+
+# -----------------------------
+# EXISTING BIN COUNT
+# -----------------------------
+def get_existing_bins(df, ptl):
+
+    ptl = ptl[ptl["Area Type"] == "PTL"]
+
+    counts = (
+        ptl.groupby(["BASEPACK", "SKU", "Batch"])
+        ["Bin Code"]
+        .nunique()
+        .reset_index()
     )
+
+    counts.rename(columns={"Bin Code": "Bins Present"}, inplace=True)
+
+    df = df.merge(
+        counts,
+        on=["BASEPACK", "SKU", "Batch"],
+        how="left"
+    )
+
+    df["Bins Present"] = df["Bins Present"].fillna(0)
 
     return df
 
 
-def load_sap_inventory(file):
-    sap = pd.read_excel(file, sheet_name="batch mapping")
-    qty_col = sap.columns[16]
-
-    sap = sap.rename(columns={
-        "product": "Product",
-        "sku": "SKU",
-        "batch": "Batch",
-        qty_col: "Available_Qty"
-    })
-
-    return sap
-
-
-def load_wms_inventory(file):
-    wms = pd.read_excel(
-        file,
-        sheet_name="HU Level",
-        usecols="C,D,E,F,M,N,Q,Y"
-    )
-
-    wms.columns = [
-        "Area", "Zone", "Bin", "BinType",
-        "Product", "SKU", "Batch", "Qty"
-    ]
-
-    wms["Zone"] = pd.to_numeric(wms["Zone"], errors="coerce")
-    wms = wms.dropna(subset=["Zone"])
-    wms["Zone"] = wms["Zone"].astype(int)
-
-    wms = wms[
-        (wms["Area"] == "PTL") &
-        (wms["Zone"] <= 8) &
-        (wms["BinType"] != "PTL3")
-    ]
-
-    return wms
-
-
-def load_sku_master(file):
-    sku = pd.read_excel(file, usecols=[0, 2])
-    sku.columns = ["Bin", "Product"]
-    return sku
-
-
-# ==================================================
-# STATE BUILDERS
-# ==================================================
-
-def build_wms_state(wms):
-    bins = (
-        wms.groupby(["SKU", "Batch", "Bin"], as_index=False)
-        .agg(Qty=("Qty", "sum"))
-    )
-
-    summary = (
-        bins.groupby(["SKU", "Batch"], as_index=False)
-        .agg(Bin_Count=("Bin", "nunique"))
-    )
-
-    return bins, summary
-
-
-# ==================================================
-# IM HELPERS
-# ==================================================
-
-def consolidate_batch(batch_row, wms_bins):
-    moves = []
-
-    bins = wms_bins[
-        (wms_bins["SKU"] == batch_row["SKU"]) &
-        (wms_bins["Batch"] == batch_row["Batch"])
-    ].sort_values("Qty")
-
-    if len(bins) <= 1:
-        return moves, []
-
-    target_bin = bins.iloc[-1]["Bin"]
-    freed_bins = []
-
-    for i in range(len(bins) - 1):
-        src = bins.iloc[i]
-        moves.append([
-            src["Bin"], "",
-            batch_row["SKU"], batch_row["Batch"],
-            "Good", "L0",
-            src["Qty"], target_bin, ""
-        ])
-        freed_bins.append(src["Bin"])
-
-    return moves, freed_bins
-
-
-def distribute_batch(batch_row, wms_bins, empty_bins):
-    moves = []
-
-    src_bins = wms_bins[
-        (wms_bins["SKU"] == batch_row["SKU"]) &
-        (wms_bins["Batch"] == batch_row["Batch"])
-    ]
-
-    # 🔑 FIX: No source bins → cannot distribute
-    if src_bins.empty:
-        return moves
-
-    src = src_bins.sort_values("Qty", ascending=False).iloc[0]
-
-    per_bin_qty = max(
-        1, int(batch_row["Quantity"] / len(empty_bins))
-    )
-
-    for b in empty_bins:
-        moves.append([
-            src["Bin"], "",
-            batch_row["SKU"], batch_row["Batch"],
-            "Good", "L0",
-            per_bin_qty, b, ""
-        ])
-
-    return moves
-
-
-
-# ==================================================
-# MAIN ENGINE
-# ==================================================
-
-def generate_ims(ptl, wms_bins, wms_summary, sku_map):
-    ims = []
-    diagnostics = []
-
-    for _, row in ptl.iterrows():
-
-        sku = row["SKU"]
-        batch = row["Batch"]
-        required = row["Required_Zones"]
-
-        current = wms_summary[
-            (wms_summary["SKU"] == sku) &
-            (wms_summary["Batch"] == batch)
-        ]
-
-        bin_count = int(current["Bin_Count"].iloc[0]) if not current.empty else 0
-
-        # Find empty bins
-        allowed_bins = set(
-            sku_map["Bin"]
-        )
-        used_bins = set(
-            wms_bins[
-                (wms_bins["SKU"] == sku) &
-                (wms_bins["Batch"] == batch)
-            ]["Bin"]
-        )
-
-        empty_bins = list(allowed_bins - used_bins)
-
-        if bin_count >= required:
-            diagnostics.append((sku, batch, "NO ACTION – sufficient bins"))
-            continue
-
-        if empty_bins:
-            ims += distribute_batch(row, wms_bins, empty_bins[:1])
-            diagnostics.append((sku, batch, "DISTRIBUTED using empty bin"))
-            continue
-
-        # Try consolidation (same SKU–Batch)
-        cons, freed = consolidate_batch(row, wms_bins)
-        if freed:
-            ims += cons
-            ims += distribute_batch(row, wms_bins, freed[:1])
-            diagnostics.append((sku, batch, "CONSOLIDATED → DISTRIBUTED"))
-        else:
-            diagnostics.append((sku, batch, "MANUAL INTERVENTION REQUIRED"))
-
-    return ims, diagnostics
-
-
-# ==================================================
-# UI
-# ==================================================
-
-st.sidebar.header("📂 Upload Files")
-
-ptl_file = st.sidebar.file_uploader("PTL Demand File", type="xlsx")
-sap_file = st.sidebar.file_uploader("SAP Inventory File", type="xlsx")
-wms_file = st.sidebar.file_uploader("WMS Inventory File", type="xlsx")
-sku_file = st.sidebar.file_uploader("SKU–Bin Mapping File", type="xlsx")
-
-run = st.sidebar.button("▶ Run Engine")
-
-if run and all([ptl_file, wms_file, sku_file]):
-
-    ptl = load_ptl_demand(ptl_file)
-    wms = load_wms_inventory(wms_file)
-    sku_map = load_sku_master(sku_file)
-
-    wms_bins, wms_summary = build_wms_state(wms)
-
-    ims, diag = generate_ims(ptl, wms_bins, wms_summary, sku_map)
-
-    im_df = pd.DataFrame(ims, columns=[
-        "Source Bin", "HU Code", "SKU", "Batch",
-        "Quality", "UOM", "Quantity",
-        "Destination Bin", "Pick HU"
-    ])
-
-    diag_df = pd.DataFrame(diag, columns=["SKU", "Batch", "Decision"])
-
-    # ================= DASHBOARD =================
-    st.subheader("📊 Decision Dashboard")
-    st.dataframe(diag_df, use_container_width=True)
-
-    # ================= PREVIEW ===================
-    st.subheader("👀 IM Preview (Before Download)")
-    st.dataframe(im_df, use_container_width=True)
-
-    # ================= DOWNLOAD ==================
-    st.subheader("⬇ Download IM File")
-    st.success(f"Total IM rows generated: {len(im_df)}")
+# -----------------------------
+# WRITE EXCEL
+# -----------------------------
+def to_excel(df):
 
     output = BytesIO()
-    im_df.to_excel(output, index=False)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="IM_Output")
+
     output.seek(0)
 
+    return output
+
+
+# -----------------------------
+# STREAMLIT UI
+# -----------------------------
+st.title("Internal Movement Automation System")
+
+uploaded_file = st.file_uploader(
+    "Upload Excel file",
+    type=["xlsx"]
+)
+
+if uploaded_file:
+
+    st.success("File uploaded successfully")
+
+    demand, sap, ptl = read_excel(uploaded_file)
+
+    basepack_map = build_basepack_map(ptl)
+
+    allocations = fefo_allocate(demand, sap, basepack_map)
+
+    bins = calculate_bins(allocations)
+
+    final = get_existing_bins(bins, ptl)
+
+    st.subheader("IM Allocation Preview")
+
+    st.dataframe(final)
+
+    excel = to_excel(final)
+
     st.download_button(
-        "Download IM Excel",
-        data=output,
-        file_name="IM_Final.xlsx",
+        label="Download IM_Output.xlsx",
+        data=excel,
+        file_name="IM_Output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
